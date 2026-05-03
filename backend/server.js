@@ -1,354 +1,214 @@
-/**
- * Backend para Sistema de Tokens - BNCC Planner
- * 
- * Este servidor gerencia:
- * 1. Criação de preferências de pagamento no Mercado Pago
- * 2. Verificação do status dos pagamentos
- * 3. Webhook para notificações automáticas
- * 4. API para gerenciamento de tokens
- */
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MercadoPagoConfig, Preference } = require('mercadopago');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Configuração do Mercado Pago
-const client = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN,
+const client = new MercadoPagoConfig({ 
+  accessToken: process.env.MP_ACCESS_TOKEN 
 });
 
 // Middleware
-app.use(cors({
-  origin: '*', // Em produção, especifique o domínio do seu frontend
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+app.use(cors());
 app.use(express.json());
 
-// ===== ARMAZENAMENTO EM MEMÓRIA (em produção, use um banco de dados) =====
-// Estrutura: { [ref_externa]: { professor_id, qtd_tokens, status, created_at } }
-const transacoes = new Map();
+// --- BANCO DE DADOS SIMULADO (Em memória) ---
+// Em produção real, use um banco como PostgreSQL ou MongoDB
+const users = {}; // { "email": { tokens: 10, history: [] } }
+const transactions = [];
 
-// ===== ROTAS DA API =====
+// --- ENDPOINTS DE AUTENTICAÇÃO ---
 
-/**
- * Health check
- */
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    service: 'bncc-planner-backend'
+// Login Simples (Cria ou recupera usuário)
+app.post('/api/auth/login', (req, res) => {
+  const { email } = req.body;
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Email é obrigatório' });
+  }
+
+  if (!users[email]) {
+    // Cria novo usuário com 0 tokens (ou 1 token de boas-vindas se quiser)
+    users[email] = {
+      email,
+      tokens: 0, 
+      createdAt: new Date(),
+      history: []
+    };
+    console.log(`Novo usuário criado: ${email}`);
+  }
+
+  // Retorna um "token de sessão" simples (apenas o email codificado para demo)
+  const sessionToken = Buffer.from(email).toString('base64');
+  
+  res.json({
+    success: true,
+    token: sessionToken,
+    user: {
+      email: users[email].email,
+      tokens: users[email].tokens
+    }
   });
 });
 
-/**
- * POST /api/mp/criar-preferencia
- * Cria uma preferência de pagamento no Mercado Pago
- */
-app.post('/api/mp/criar-preferencia', async (req, res) => {
+// Buscar dados do usuário
+app.get('/api/auth/user/:emailBase64', (req, res) => {
   try {
-    const { 
-      titulo, 
-      valor_centavos, 
-      ref_externa, 
-      qtd_tokens, 
-      professor_id, 
-      professor_email 
-    } = req.body;
-
-    // Validações básicas
-    if (!titulo || !valor_centavos || !ref_externa || !qtd_tokens || !professor_id) {
-      return res.status(400).json({ erro: 'Parâmetros obrigatórios faltando' });
+    const email = Buffer.from(req.params.emailBase64, 'base64').toString('utf-8');
+    
+    if (!users[email]) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
-    if (valor_centavos < 100) {
-      return res.status(400).json({ erro: 'Valor mínimo é R$ 1,00' });
-    }
-
-    // Armazena a transação como pendente
-    transacoes.set(ref_externa, {
-      professor_id,
-      professor_email,
-      qtd_tokens,
-      valor_centavos,
-      status: 'pendente',
-      created_at: new Date().toISOString(),
-      payment_id: null
+    res.json({
+      success: true,
+      user: {
+        email: users[email].email,
+        tokens: users[email].tokens,
+        history: users[email].history
+      }
     });
+  } catch (e) {
+    res.status(400).json({ error: 'Token inválido' });
+  }
+});
 
-    // Cria a preferência no Mercado Pago
+// --- ENDPOINTS DE PAGAMENTO ---
+
+// Criar preferência de pagamento
+app.post('/api/mp/criar-preferencia', async (req, res) => {
+  const { title, quantity, price, userEmail } = req.body;
+
+  if (!userEmail) {
+    return res.status(400).json({ error: 'User email is required for payment' });
+  }
+
+  try {
     const preference = new Preference(client);
     
-    const preferenceData = {
+    const result = await preference.create({
       body: {
         items: [
           {
-            title: titulo,
-            quantity: 1,
-            unit_price: valor_centavos / 100, // Mercado Pago usa valor em reais
-            currency_id: 'BRL'
-          }
+            title: title || 'Pacote de Tokens BNCC',
+            quantity: Number(quantity),
+            unit_price: Number(price),
+            currency_id: 'BRL',
+          },
         ],
-        external_reference: ref_externa,
-        notification_url: `${process.env.BACKEND_URL || 'http://localhost:' + PORT}/api/mp/webhook`,
+        external_reference: userEmail, // Usamos o email como referência para saber quem pagou
         metadata: {
-          professor_id,
-          qtd_tokens: String(qtd_tokens)
+          user_email: userEmail,
+          quantity: quantity,
+          type: 'tokens'
         },
         back_urls: {
-          success: `${process.env.BACKEND_URL || 'http://localhost:' + PORT}/api/mp/sucesso`,
-          failure: `${process.env.BACKEND_URL || 'http://localhost:' + PORT}/api/mp/falha`,
-          pending: `${process.env.BACKEND_URL || 'http://localhost:' + PORT}/api/mp/pendente`
+          success: `${process.env.BACKEND_URL || 'http://localhost:3000'}/success`,
+          failure: `${process.env.BACKEND_URL || 'http://localhost:3000'}/failure`,
+          pending: `${process.env.BACKEND_URL || 'http://localhost:3000'}/pending`,
         },
-        auto_return: 'approved' // Retorna automaticamente após aprovação
-      }
-    };
+        auto_return: 'approved',
+      },
+    });
 
-    const result = await preference.create(preferenceData);
-
-    // Retorna a URL de checkout para o frontend
-    res.json({
-      init_point: result.init_point,
+    // Salva transação pendente
+    transactions.push({
       id: result.id,
-      ref_externa
+      userEmail,
+      status: 'pending',
+      amount: price * quantity,
+      date: new Date()
+    });
+
+    res.json({ 
+      id: result.id, 
+      init_point: result.init_point,
+      sandbox_init_point: result.sandbox_init_point
     });
 
   } catch (error) {
     console.error('Erro ao criar preferência:', error);
-    res.status(500).json({ 
-      erro: 'Erro ao criar preferência de pagamento',
-      detalhes: error.message 
-    });
+    res.status(500).json({ error: 'Erro ao iniciar pagamento', details: error.message });
   }
 });
 
-/**
- * GET /api/mp/verificar/:ref
- * Verifica o status de uma transação específica
- */
-app.get('/api/mp/verificar/:ref', async (req, res) => {
+// Verificar status do pagamento (Polling)
+app.get('/api/mp/verificar/:preferenceId', async (req, res) => {
+  const { preferenceId } = req.params;
+
   try {
-    const { ref } = req.params;
+    const preference = new Preference(client);
+    const result = await preference.get({ id: preferenceId });
     
-    const transacao = transacoes.get(ref);
+    // Busca transação local
+    const transaction = transactions.find(t => t.id === preferenceId);
     
-    if (!transacao) {
-      return res.status(404).json({ erro: 'Transação não encontrada' });
-    }
+    // Se aprovado e ainda não liberado
+    if (result.status === 'approved' && (!transaction || transaction.status !== 'released')) {
+      const email = result.external_reference;
+      const qty = result.metadata?.quantity || 1;
 
-    // Se já estiver aprovado, retorna imediatamente
-    if (transacao.status === 'aprovado') {
-      return res.json({ 
-        aprovado: true, 
-        qtd_tokens: transacao.qtd_tokens,
-        status: transacao.status 
-      });
-    }
-
-    // Consulta o status atualizado no Mercado Pago
-    if (transacao.payment_id) {
-      try {
-        const mercadopago = require('mercadopago');
-        const payment = await mercadopago.payment.get(transacao.payment_id);
+      if (users[email]) {
+        users[email].tokens += parseInt(qty);
+        users[email].history.push({
+          type: 'compra',
+          amount: qty,
+          date: new Date(),
+          id: preferenceId
+        });
         
-        if (payment.status === 'approved') {
-          // Atualiza a transação local
-          transacao.status = 'aprovado';
-          transacoes.set(ref, transacao);
-          
-          return res.json({ 
-            aprovado: true, 
-            qtd_tokens: transacao.qtd_tokens,
-            status: 'aprovado'
-          });
-        }
-      } catch (err) {
-        console.error('Erro ao consultar pagamento:', err);
-        // Continua e retorna status atual mesmo sem conseguir consultar MP
+        if (transaction) transaction.status = 'released';
+        
+        console.log(`✅ Tokens liberados para ${email}: +${qty}`);
       }
     }
 
-    // Retorna status atual (ainda pendente)
-    res.json({ 
-      aprovado: false, 
-      status: transacao.status,
-      aguardando: true
+    res.json({
+      status: result.status,
+      tokens: result.external_reference ? users[result.external_reference]?.tokens : 0
     });
 
   } catch (error) {
-    console.error('Erro ao verificar transação:', error);
-    res.status(500).json({ 
-      erro: 'Erro ao verificar status do pagamento',
-      detalhes: error.message 
-    });
+    console.error('Erro ao verificar pagamento:', error);
+    res.status(500).json({ error: 'Erro ao verificar status' });
   }
 });
 
-/**
- * POST /api/mp/webhook
- * Recebe notificações do Mercado Pago sobre mudanças no status dos pagamentos
- */
+// Webhook (Notificação automática)
 app.post('/api/mp/webhook', async (req, res) => {
-  try {
-    const { action, data } = req.body;
+  const { action, data } = req.body;
 
-    console.log('Webhook recebido:', { action, data });
-
-    // Apenas processa notificações de pagamento
-    if (action !== 'payment.created' && action !== 'payment.updated') {
-      return res.status(200).send('OK');
-    }
-
-    const paymentId = data.id;
-    
-    // Consulta os detalhes do pagamento
-    const mercadopago = require('mercadopago');
-    const payment = await mercadopago.payment.get(paymentId);
-    
-    const externalRef = payment.external_reference;
-    
-    if (!externalRef || !transacoes.has(externalRef)) {
-      console.log('Transação não encontrada ou sem referência:', externalRef);
-      return res.status(200).send('OK');
-    }
-
-    const transacao = transacoes.get(externalRef);
-
-    // Atualiza o status baseado na resposta do MP
-    if (payment.status === 'approved') {
-      transacao.status = 'aprovado';
-      transacao.payment_id = paymentId;
-      transacao.approved_at = new Date().toISOString();
-      
-      console.log(`✅ Pagamento aprovado! Ref: ${externalRef}, Tokens: ${transacao.qtd_tokens}`);
-    } else if (payment.status === 'rejected' || payment.status === 'cancelled') {
-      transacao.status = payment.status;
-      console.log(`❌ Pagamento ${payment.status}. Ref: ${externalRef}`);
-    }
-
-    transacoes.set(externalRef, transacao);
-
-    res.status(200).send('OK');
-
-  } catch (error) {
-    console.error('Erro ao processar webhook:', error);
-    res.status(500).send('Erro interno');
+  if (action === 'payment.created' || action === 'payment.updated') {
+    // Lógica similar à de verificação, mas disparada pelo MP
+    console.log('Webhook recebido:', data.id);
+    // Em produção, consulte a API de Payments (não Preference) aqui para detalhes finais
   }
+
+  res.status(200).send('OK');
 });
 
-/**
- * Rotas de callback (opcional - para redirecionamento após pagamento)
- */
-app.get('/api/mp/sucesso', (req, res) => {
-  const { collection_id, external_reference } = req.query;
-  res.send(`
-    <html>
-      <head><title>Pagamento Aprovado!</title></head>
-      <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-        <h1 style="color: #27ae60;">✅ Pagamento Aprovado!</h1>
-        <p>Seus tokens serão liberados em instantes.</p>
-        <p>Referência: ${external_reference}</p>
-        <script>
-          setTimeout(() => window.close(), 3000);
-        </script>
-      </body>
-    </html>
-  `);
-});
-
-app.get('/api/mp/falha', (req, res) => {
-  res.send(`
-    <html>
-      <head><title>Pagamento Não Aprovado</title></head>
-      <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-        <h1 style="color: #e74c3c;">❌ Pagamento Não Aprovado</h1>
-        <p>Você pode tentar novamente.</p>
-        <script>
-          setTimeout(() => window.close(), 3000);
-        </script>
-      </body>
-    </html>
-  `);
-});
-
-app.get('/api/mp/pendente', (req, res) => {
-  res.send(`
-    <html>
-      <head><title>Pagamento Pendente</title></head>
-      <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-        <h1 style="color: #f39c12;">⏳ Aguardando Pagamento</h1>
-        <p>Assim que o pagamento for confirmado, seus tokens serão liberados.</p>
-        <script>
-          setTimeout(() => window.close(), 3000);
-        </script>
-      </body>
-    </html>
-  `);
-});
-
-/**
- * GET /api/admin/transacoes
- * Lista todas as transações (para administração)
- */
-app.get('/api/admin/transacoes', (req, res) => {
-  // Em produção, adicione autenticação aqui
-  const lista = Array.from(transacoes.entries()).map(([ref, dados]) => ({
-    ref,
-    ...dados
-  }));
-  
-  res.json({ transacoes: lista, total: lista.length });
-});
-
-/**
- * DELETE /api/admin/limpar-transacoes
- * Limpa transações antigas (para administração)
- */
-app.delete('/api/admin/limpar-transacoes', (req, res) => {
-  // Em produção, adicione autenticação aqui
-  const agora = new Date();
-  let removidas = 0;
-  
-  transacoes.forEach((dados, ref) => {
-    const criacao = new Date(dados.created_at);
-    const diffHoras = (agora - criacao) / (1000 * 60 * 60);
-    
-    // Remove transações com mais de 24 horas
-    if (diffHoras > 24) {
-      transacoes.delete(ref);
-      removidas++;
-    }
+// Health Check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'bncc-planner-backend',
+    users_count: Object.keys(users).length
   });
-  
-  res.json({ removidas, mensagem: `${removidas} transações antigas removidas` });
 });
-
-// ===== INICIALIZAÇÃO =====
 
 app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════════════════╗
-║  🚀 Backend BNCC Planner iniciado!                ║
-║  Porta: ${PORT}                                    ║
-║  Ambiente: ${process.env.NODE_ENV || 'desenvolvimento'}                       ║
-╠════════════════════════════════════════════════════╣
-║  Endpoints principais:                            ║
-║  POST /api/mp/criar-preferencia                   ║
-║  GET  /api/mp/verificar/:ref                      ║
-║  POST /api/mp/webhook                             ║
-╠════════════════════════════════════════════════════╣
-║  ⚠️  LEMBRE-SE:                                   ║
-║  1. Configure MP_ACCESS_TOKEN no .env             ║
-║  2. Configure BACKEND_URL com URL pública         ║
-║  3. Em produção, use HTTPS                        ║
-╚════════════════════════════════════════════════════╝
-  `);
+  console.log(`╔════════════════════════════════════════════════════╗`);
+  console.log(`║  🚀 Backend BNCC Planner iniciado!                ║`);
+  console.log(`║  Porta: ${PORT}                                    ║`);
+  console.log(`║  Ambiente: ${process.env.NODE_ENV || 'development'}                       ║`);
+  console.log(`╠════════════════════════════════════════════════════╣`);
+  console.log(`║  Endpoints principais:                            ║`);
+  console.log(`║  POST /api/auth/login                             ║`);
+  console.log(`║  POST /api/mp/criar-preferencia                   ║`);
+  console.log(`║  GET  /api/mp/verificar/:ref                      ║`);
+  console.log(`╚════════════════════════════════════════════════════╝`);
 });
-
-module.exports = app;
